@@ -18,8 +18,16 @@ namespace RoadheaderSandbox.Kinematics
         public double targetAngle;
         public double angularVelocity;
         public double maxAngularVelocity = 180.0;
+
+        [Tooltip("单步最大角度变化 (rad)，防止鬼抽")]
+        public double maxAngleDeltaPerStep = 5.0 * Mathd.Deg2Rad;
+
         public double damping = 5.0;
         public double stiffness = 100.0;
+
+        private Quaterniond _initialRotation;
+        private Quaterniond _currentRotation;
+        private bool _rotationInitialized;
 
         public Vector3d StartPosition => transform != null ? Vector3d.FromVector3(transform.position) : Vector3d.Zero;
 
@@ -33,30 +41,74 @@ namespace RoadheaderSandbox.Kinematics
             }
         }
 
+        public void InitializeRotation()
+        {
+            if (transform == null || _rotationInitialized) return;
+            _initialRotation = Quaterniond.FromQuaternion(transform.localRotation);
+            _currentRotation = _initialRotation;
+            _rotationInitialized = true;
+        }
+
         public void ApplyAngle(double angle, double deltaTime)
         {
+            if (deltaTime <= 0) deltaTime = 0.001;
+            InitializeRotation();
+
             targetAngle = Mathd.Clamp(angle, minAngle, maxAngle);
-            currentAngle = Mathd.MoveTowardsAngle(currentAngle, targetAngle, maxAngularVelocity * Mathd.Deg2Rad * deltaTime);
-            if (transform != null)
+            double maxDelta = maxAngularVelocity * Mathd.Deg2Rad * deltaTime;
+            maxDelta = Mathd.Min(maxDelta, maxAngleDeltaPerStep);
+            double newAngle = Mathd.MoveTowardsAngle(currentAngle, targetAngle, maxDelta);
+            currentAngle = newAngle;
+
+            if (transform != null && jointAxis.SqrMagnitude > 1e-15)
             {
-                Vector3 axis = jointAxis.ToVector3();
-                transform.localRotation = Quaternion.AngleAxis((float)(currentAngle * Mathd.Rad2Deg), axis);
+                Vector3d axis = jointAxis.Normalized;
+                Quaterniond axisRot = Quaterniond.AxisAngle(axis, currentAngle);
+                Quaterniond targetRot = (axisRot * _initialRotation).Normalized;
+                double slerpT = Mathd.Clamp01(deltaTime * 50.0);
+                _currentRotation = Quaterniond.Slerp(_currentRotation, targetRot, slerpT);
+                transform.localRotation = _currentRotation.ToQuaternion();
             }
         }
 
         public void UpdateDynamics(double deltaTime)
         {
+            if (deltaTime <= 0) deltaTime = 0.001;
+            InitializeRotation();
+
             double angleError = targetAngle - currentAngle;
             angularVelocity += angleError * stiffness * deltaTime;
             angularVelocity *= Mathd.Max(0, 1.0 - damping * deltaTime);
-            angularVelocity = Mathd.Clamp(angularVelocity, -maxAngularVelocity, maxAngularVelocity);
-            currentAngle += angularVelocity * deltaTime;
+            double maxOmega = maxAngularVelocity * Mathd.Deg2Rad;
+            angularVelocity = Mathd.Clamp(angularVelocity, -maxOmega, maxOmega);
+
+            double maxDelta = maxOmega * deltaTime;
+            maxDelta = Mathd.Min(maxDelta, maxAngleDeltaPerStep);
+            double angleDelta = Mathd.Clamp(angularVelocity * deltaTime, -maxDelta, maxDelta);
+            currentAngle += angleDelta;
             currentAngle = Mathd.Clamp(currentAngle, minAngle, maxAngle);
 
+            if (transform != null && jointAxis.SqrMagnitude > 1e-15)
+            {
+                Vector3d axis = jointAxis.Normalized;
+                Quaterniond axisRot = Quaterniond.AxisAngle(axis, currentAngle);
+                Quaterniond targetRot = (axisRot * _initialRotation).Normalized;
+                double slerpT = Mathd.Clamp01(deltaTime * 50.0);
+                _currentRotation = Quaterniond.Slerp(_currentRotation, targetRot, slerpT);
+                transform.localRotation = _currentRotation.ToQuaternion();
+            }
+        }
+
+        public void ResetToInitial()
+        {
+            InitializeRotation();
+            currentAngle = 0;
+            targetAngle = 0;
+            angularVelocity = 0;
             if (transform != null)
             {
-                Vector3 axis = jointAxis.ToVector3();
-                transform.localRotation = Quaternion.AngleAxis((float)(currentAngle * Mathd.Rad2Deg), axis);
+                _currentRotation = _initialRotation;
+                transform.localRotation = _initialRotation.ToQuaternion();
             }
         }
     }
@@ -77,6 +129,9 @@ namespace RoadheaderSandbox.Kinematics
         public double ikTolerance = 0.001;
         public double ikDamping = 0.1;
 
+        [Tooltip("IK单步最大角度变化 (rad)")]
+        public double ikMaxAngleDelta = 2.0 * Mathd.Deg2Rad;
+
         [Header("机体坐标系")]
         public Transform bodyFrame;
         public bool useBodyFrame = true;
@@ -85,9 +140,14 @@ namespace RoadheaderSandbox.Kinematics
         public bool enableDynamics = true;
         public double gravity = 9.81;
 
+        [Header("数值稳定器")]
+        [Tooltip("整体位置硬约束半径 (m)")]
+        public double maxReachHardLimit = 6.0;
+
         private Vector3d _targetPosition;
         private Quaterniond _targetRotation;
         private bool _hasTarget;
+        private Vector3d _lastValidEndPosition;
 
         public event Action<int, double> OnSegmentAngleChanged;
         public event Action<Vector3d> OnEndEffectorPositionChanged;
@@ -108,11 +168,13 @@ namespace RoadheaderSandbox.Kinematics
             {
                 if (segments[i].transform != null)
                 {
-                    Vector3 localEuler = segments[i].transform.localRotation.eulerAngles;
-                    segments[i].currentAngle = localEuler.y * Mathd.Deg2Rad;
-                    segments[i].targetAngle = segments[i].currentAngle;
+                    segments[i].InitializeRotation();
+                    segments[i].currentAngle = 0;
+                    segments[i].targetAngle = 0;
+                    segments[i].angularVelocity = 0;
                 }
             }
+            _lastValidEndPosition = GetEndEffectorPosition();
         }
 
         public void SetTarget(Vector3d position, Quaterniond rotation)
@@ -120,12 +182,34 @@ namespace RoadheaderSandbox.Kinematics
             _targetPosition = position;
             _targetRotation = rotation;
             _hasTarget = true;
+            ClampTargetPosition();
         }
 
         public void SetTargetPosition(Vector3d position)
         {
             _targetPosition = position;
             _hasTarget = true;
+            ClampTargetPosition();
+        }
+
+        private void ClampTargetPosition()
+        {
+            if (segments.Count == 0) return;
+
+            Vector3d basePos = segments[0].StartPosition;
+            Vector3d toTarget = _targetPosition - basePos;
+            double distance = toTarget.Magnitude;
+
+            if (distance > maxReachHardLimit)
+            {
+                _targetPosition = basePos + toTarget.Normalized * maxReachHardLimit;
+            }
+
+            if (double.IsNaN(_targetPosition.x) || double.IsNaN(_targetPosition.y) || double.IsNaN(_targetPosition.z) ||
+                double.IsInfinity(_targetPosition.x) || double.IsInfinity(_targetPosition.y) || double.IsInfinity(_targetPosition.z))
+            {
+                _targetPosition = _lastValidEndPosition;
+            }
         }
 
         public void ClearTarget()
@@ -167,6 +251,8 @@ namespace RoadheaderSandbox.Kinematics
 
         public void UpdateKinematics(double deltaTime)
         {
+            if (deltaTime <= 0) deltaTime = 0.001;
+
             if (_hasTarget && useInverseKinematics)
             {
                 SolveInverseKinematics();
@@ -185,7 +271,13 @@ namespace RoadheaderSandbox.Kinematics
                 OnSegmentAngleChanged?.Invoke(i, segments[i].currentAngle);
             }
 
-            OnEndEffectorPositionChanged?.Invoke(GetEndEffectorPosition());
+            Vector3d endPos = GetEndEffectorPosition();
+            if (!double.IsNaN(endPos.x) && !double.IsNaN(endPos.y) && !double.IsNaN(endPos.z) &&
+                !double.IsInfinity(endPos.x) && !double.IsInfinity(endPos.y) && !double.IsInfinity(endPos.z))
+            {
+                _lastValidEndPosition = endPos;
+            }
+            OnEndEffectorPositionChanged?.Invoke(_lastValidEndPosition);
         }
 
         private void SolveInverseKinematics()
@@ -222,14 +314,18 @@ namespace RoadheaderSandbox.Kinematics
 
                 for (int i = 0; i < segments.Count; i++)
                 {
-                    angles[i] += deltaAngles[i];
+                    double clampedDelta = Mathd.Clamp(deltaAngles[i], -ikMaxAngleDelta, ikMaxAngleDelta);
+                    angles[i] += clampedDelta;
                     angles[i] = Mathd.Clamp(angles[i], segments[i].minAngle, segments[i].maxAngle);
                 }
             }
 
             for (int i = 0; i < segments.Count; i++)
             {
-                segments[i].targetAngle = angles[i];
+                double current = segments[i].targetAngle;
+                double next = angles[i];
+                double maxDelta = segments[i].maxAngleDeltaPerStep;
+                segments[i].targetAngle = Mathd.MoveTowardsAngle(current, next, maxDelta);
             }
         }
 
@@ -271,6 +367,9 @@ namespace RoadheaderSandbox.Kinematics
             for (int i = 0; i < n; i++)
             {
                 Vector3d axis = jointRotations[i] * segments[i].jointAxis;
+                if (axis.SqrMagnitude < 1e-15) continue;
+                axis = axis.Normalized;
+
                 Vector3d lever = endPos - jointPositions[i];
                 Vector3d velocity = Vector3d.Cross(axis, lever);
 
@@ -349,6 +448,12 @@ namespace RoadheaderSandbox.Kinematics
             {
                 Gizmos.color = Color.red;
                 Gizmos.DrawSphere(_targetPosition.ToVector3(), 0.1f);
+
+                Gizmos.color = new Color(1, 0, 0, 0.1f);
+                if (segments.Count > 0)
+                {
+                    Gizmos.DrawWireSphere(segments[0].StartPosition.ToVector3(), (float)maxReachHardLimit);
+                }
             }
         }
     }

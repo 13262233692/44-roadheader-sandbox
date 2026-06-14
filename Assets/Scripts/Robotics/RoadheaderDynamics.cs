@@ -95,6 +95,34 @@ namespace RoadheaderSandbox.Robotics
         [Tooltip("是否启用重力")]
         public bool enableGravity = true;
 
+        [Header("数值稳定器 - 硬性截断钳制")]
+        [Tooltip("整机合力硬上限 (N)，超过直接截断")]
+        public double maxTotalForce = 2.0e6;
+
+        [Tooltip("整机合扭矩硬上限 (N·m)")]
+        public double maxTotalTorque = 1.0e6;
+
+        [Tooltip("最大线加速度 (m/s²)，约10g")]
+        public double maxLinearAcceleration = 100.0;
+
+        [Tooltip("最大角加速度 (rad/s²)")]
+        public double maxAngularAcceleration = 20.0;
+
+        [Tooltip("最大线速度 (m/s)")]
+        public double maxLinearVelocity = 5.0;
+
+        [Tooltip("最大角速度 (rad/s)")]
+        public double maxAngularVelocity = 10.0;
+
+        [Tooltip("作业区域硬约束 - 机体原点最大活动半径 (m)")]
+        public double maxWorldPositionRadius = 50.0;
+
+        [Tooltip("最大允许俯仰角 (deg)，防止倒立")]
+        public double maxPitchAngle = 45.0;
+
+        [Tooltip("最大允许侧倾角 (deg)，防止侧翻")]
+        public double maxRollAngle = 45.0;
+
         [Header("系统引用")]
         public CuttingHeadMotionController cuttingHeadController;
         public ArmSkeletonController armController;
@@ -121,6 +149,8 @@ namespace RoadheaderSandbox.Robotics
 
         private double _accumulatedTime;
         private bool _initialized;
+        private Vector3d _lastValidPosition;
+        private Quaterniond _lastValidRotation;
 
         private void Awake()
         {
@@ -138,6 +168,9 @@ namespace RoadheaderSandbox.Robotics
             bodyState.position = Vector3d.FromVector3(bodyFrame.position);
             bodyState.rotation = Quaterniond.FromQuaternion(bodyFrame.rotation);
             bodyState.SetBoxInertia(totalMass, Vector3d.FromVector3(machineSize));
+
+            _lastValidPosition = bodyState.position;
+            _lastValidRotation = bodyState.rotation;
 
             if (cuttingHeadController == null)
                 cuttingHeadController = GetComponentInChildren<CuttingHeadMotionController>();
@@ -158,14 +191,17 @@ namespace RoadheaderSandbox.Robotics
         {
             if (!_initialized) Initialize();
             if (!enableDynamics) return;
+            if (deltaTime <= 0) deltaTime = 0.001;
 
             _accumulatedTime += deltaTime;
 
             int subSteps = Math.Min(maxSubSteps, (int)Math.Ceiling(_accumulatedTime / fixedTimestep));
+            subSteps = Math.Max(1, subSteps);
 
             for (int i = 0; i < subSteps; i++)
             {
                 double stepTime = Math.Min(fixedTimestep, _accumulatedTime);
+                if (stepTime <= 0) stepTime = 0.001;
                 _accumulatedTime -= stepTime;
 
                 PhysicsStep(stepTime);
@@ -175,6 +211,7 @@ namespace RoadheaderSandbox.Robotics
         private void PhysicsStep(double dt)
         {
             if (!_initialized) return;
+            if (dt <= 0) dt = 0.001;
 
             Vector3d totalForce = Vector3d.Zero;
             Vector3d totalTorque = Vector3d.Zero;
@@ -196,7 +233,7 @@ namespace RoadheaderSandbox.Robotics
                     : bodyState.rotation;
 
                 Vector3d headAngVel = cuttingHeadController != null
-                    ? cuttingHeadController.GetTangent() * cuttingHeadController.spinSpeed
+                    ? cuttingHeadController.GetTangent() * Mathd.Clamp(cuttingHeadController.spinSpeed, -50.0, 50.0)
                     : Vector3d.Zero;
 
                 double spinAngle = cuttingHeadController != null
@@ -206,11 +243,21 @@ namespace RoadheaderSandbox.Robotics
                 collisionSolver.UpdateHeadState(headPos, headRot, headAngVel, spinAngle, dt);
 
                 cuttingResistance = -collisionSolver.totalContactForce;
+                if (double.IsNaN(cuttingResistance.x) || double.IsNaN(cuttingResistance.y) || double.IsNaN(cuttingResistance.z) ||
+                    double.IsInfinity(cuttingResistance.x) || double.IsInfinity(cuttingResistance.y) || double.IsInfinity(cuttingResistance.z))
+                {
+                    cuttingResistance = Vector3d.Zero;
+                }
                 totalForce += cuttingResistance;
 
                 Vector3d torqueArm = headPos - bodyState.position;
-                totalTorque += Vector3d.Cross(torqueArm, -collisionSolver.totalContactForce);
-                totalTorque += collisionSolver.totalContactTorque;
+                double torqueMagLimit = maxTotalTorque * 0.5;
+                Vector3d contactTorque = Vector3d.Cross(torqueArm, -collisionSolver.totalContactForce);
+                contactTorque = ClampVectorMagnitude(contactTorque, torqueMagLimit);
+                totalTorque += contactTorque;
+
+                Vector3d solverTorque = ClampVectorMagnitude(collisionSolver.totalContactTorque, torqueMagLimit);
+                totalTorque += solverTorque;
             }
 
             propulsionForce = CalculatePropulsionForce(dt);
@@ -222,7 +269,11 @@ namespace RoadheaderSandbox.Robotics
             totalForce += externalForce;
             totalTorque += externalTorque;
 
+            totalForce = ClampVectorMagnitude(totalForce, maxTotalForce);
+            totalTorque = ClampVectorMagnitude(totalTorque, maxTotalTorque);
+
             Integrate(totalForce, totalTorque, dt);
+            EnforcePoseHardLimits();
 
             if (bodyFrame != null)
             {
@@ -230,8 +281,26 @@ namespace RoadheaderSandbox.Robotics
                 bodyFrame.rotation = bodyState.rotation.ToQuaternion();
             }
 
+            externalForce = Vector3d.Zero;
+            externalTorque = Vector3d.Zero;
+
             OnPhysicsStep?.Invoke(bodyState);
             OnForcesUpdated?.Invoke(totalForce, totalTorque);
+        }
+
+        private Vector3d ClampVectorMagnitude(Vector3d vec, double maxMag)
+        {
+            double mag = vec.Magnitude;
+            if (mag > maxMag && mag > 1e-15)
+            {
+                return vec.Normalized * maxMag;
+            }
+            if (double.IsNaN(vec.x) || double.IsNaN(vec.y) || double.IsNaN(vec.z) ||
+                double.IsInfinity(vec.x) || double.IsInfinity(vec.y) || double.IsInfinity(vec.z))
+            {
+                return Vector3d.Zero;
+            }
+            return vec;
         }
 
         private Vector3d CalculatePropulsionForce(double dt)
@@ -239,6 +308,11 @@ namespace RoadheaderSandbox.Robotics
             if (cuttingHeadController == null) return Vector3d.Zero;
 
             Vector3d desiredDirection = cuttingHeadController.GetTangent();
+            if (desiredDirection.SqrMagnitude < 1e-15)
+            {
+                desiredDirection = Vector3d.Forward;
+            }
+            desiredDirection = desiredDirection.Normalized;
 
             double targetSpeed = cuttingHeadController.traverseSpeed * 0.1;
             double speedError = targetSpeed - currentSpeed;
@@ -247,10 +321,10 @@ namespace RoadheaderSandbox.Robotics
             forceMagnitude = Mathd.Clamp(forceMagnitude, -maxPropulsionForce, maxPropulsionForce);
 
             Vector3d propulsion = desiredDirection * forceMagnitude;
-
             Vector3d dampingForce = -bodyState.linearVelocity * propulsionDamping;
 
-            return propulsion + dampingForce;
+            Vector3d total = propulsion + dampingForce;
+            return ClampVectorMagnitude(total, maxPropulsionForce);
         }
 
         private Vector3d CalculateGroundContactForce()
@@ -291,18 +365,20 @@ namespace RoadheaderSandbox.Robotics
             {
                 double stiffness = 1e8;
                 double damping = 1e6;
+                double maxGroundForce = bodyState.mass * gravity * 2.0;
 
                 for (int i = 0; i < 4; i++)
                 {
                     if (trackY[i] < 0)
                     {
                         double normalForce = -trackY[i] * stiffness;
-                        normalForce = Mathd.Min(normalForce, bodyState.mass * gravity * 0.5);
+                        normalForce = Mathd.Min(normalForce, maxGroundForce * 0.5);
 
                         double verticalVel = Vector3d.Dot(bodyState.linearVelocity, Vector3d.Up);
                         if (verticalVel < 0)
                         {
                             normalForce += -verticalVel * damping;
+                            normalForce = Mathd.Min(normalForce, maxGroundForce * 0.5);
                         }
 
                         force += Vector3d.Up * normalForce;
@@ -313,58 +389,128 @@ namespace RoadheaderSandbox.Robotics
                 }
 
                 Vector3d lateralVel = bodyState.linearVelocity - bodyUp * Vector3d.Dot(bodyState.linearVelocity, bodyUp);
-                double frictionCoeff = 0.8;
-                double maxFriction = bodyState.mass * gravity * frictionCoeff;
-                double lateralForceMag = Mathd.Min(lateralVel.Magnitude * 1e5, maxFriction);
-                force += -lateralVel.Normalized * lateralForceMag;
+                double lateralSpeed = lateralVel.Magnitude;
+                if (lateralSpeed > 1e-15)
+                {
+                    double frictionCoeff = 0.8;
+                    double maxFriction = bodyState.mass * gravity * frictionCoeff;
+                    double lateralForceMag = Mathd.Min(lateralSpeed * 1e5, maxFriction);
+                    force += -lateralVel.Normalized * lateralForceMag;
+                }
             }
 
-            externalTorque += torque;
-            currentSpeed = Vector3d.Dot(bodyState.linearVelocity, bodyForward);
-            currentAdvanceRate = Vector3d.Dot(bodyState.linearVelocity, bodyForward) * 3600.0 / 1000.0;
+            externalTorque += ClampVectorMagnitude(torque, maxTotalTorque * 0.5);
 
-            return force;
+            currentSpeed = Vector3d.Dot(bodyState.linearVelocity, bodyForward);
+            currentAdvanceRate = currentSpeed * 3600.0 / 1000.0;
+
+            return ClampVectorMagnitude(force, maxTotalForce * 0.8);
         }
 
         private void Integrate(Vector3d force, Vector3d torque, double dt)
         {
-            bodyState.linearAcceleration = force / bodyState.mass;
-            bodyState.linearVelocity += bodyState.linearAcceleration * dt;
-            bodyState.position += bodyState.linearVelocity * dt;
+            if (dt <= 0) dt = 0.001;
 
-            Matrix4x4d worldInertia = bodyState.rotation.ToMatrix4x4d() *
-                                      bodyState.inertiaTensor *
-                                      bodyState.rotation.ToMatrix4x4d().Inverse;
+            bodyState.linearAcceleration = force / bodyState.mass;
+            bodyState.linearAcceleration = ClampVectorMagnitude(bodyState.linearAcceleration, maxLinearAcceleration);
+
+            bodyState.linearVelocity += bodyState.linearAcceleration * dt;
+            bodyState.linearVelocity = ClampVectorMagnitude(bodyState.linearVelocity, maxLinearVelocity);
+
+            Vector3d newPosition = bodyState.position + bodyState.linearVelocity * dt;
+            if (double.IsNaN(newPosition.x) || double.IsNaN(newPosition.y) || double.IsNaN(newPosition.z) ||
+                double.IsInfinity(newPosition.x) || double.IsInfinity(newPosition.y) || double.IsInfinity(newPosition.z))
+            {
+                newPosition = _lastValidPosition;
+                bodyState.linearVelocity = Vector3d.Zero;
+                bodyState.linearAcceleration = Vector3d.Zero;
+            }
+            bodyState.position = newPosition;
+
+            Matrix4x4d worldInertia;
+            try
+            {
+                worldInertia = bodyState.rotation.ToMatrix4x4d() *
+                               bodyState.inertiaTensor *
+                               bodyState.rotation.ToMatrix4x4d().Inverse;
+            }
+            catch
+            {
+                worldInertia = Matrix4x4d.Identity;
+            }
 
             bodyState.angularAcceleration = worldInertia.MultiplyVector(torque);
+            bodyState.angularAcceleration = ClampVectorMagnitude(bodyState.angularAcceleration, maxAngularAcceleration);
+
             bodyState.angularVelocity += bodyState.angularAcceleration * dt;
+            bodyState.angularVelocity = ClampVectorMagnitude(bodyState.angularVelocity, maxAngularVelocity);
 
             double angle = bodyState.angularVelocity.Magnitude * dt;
-            if (angle > 1e-12)
+            if (angle > 1e-12 && angle < Mathd.PI)
             {
                 Vector3d axis = bodyState.angularVelocity.Normalized;
                 Quaterniond deltaRot = Quaterniond.AxisAngle(axis, angle);
-                bodyState.rotation = (deltaRot * bodyState.rotation).Normalized;
+                Quaterniond newRot = (deltaRot * bodyState.rotation).Normalized;
+
+                if (double.IsNaN(newRot.x) || double.IsNaN(newRot.y) || double.IsNaN(newRot.z) || double.IsNaN(newRot.w) ||
+                    double.IsInfinity(newRot.x) || double.IsInfinity(newRot.y) || double.IsInfinity(newRot.z) || double.IsInfinity(newRot.w))
+                {
+                    newRot = _lastValidRotation;
+                    bodyState.angularVelocity = Vector3d.Zero;
+                    bodyState.angularAcceleration = Vector3d.Zero;
+                }
+                bodyState.rotation = newRot;
             }
 
-            double maxVelocity = 5.0;
-            if (bodyState.linearVelocity.Magnitude > maxVelocity)
+            _lastValidPosition = bodyState.position;
+            _lastValidRotation = bodyState.rotation;
+        }
+
+        private void EnforcePoseHardLimits()
+        {
+            if (bodyState.position.Magnitude > maxWorldPositionRadius)
             {
-                bodyState.linearVelocity = bodyState.linearVelocity.Normalized * maxVelocity;
+                bodyState.position = bodyState.position.Normalized * maxWorldPositionRadius;
+                bodyState.linearVelocity = Vector3d.Zero;
             }
 
-            double maxAngularVelocity = 10.0;
-            if (bodyState.angularVelocity.Magnitude > maxAngularVelocity)
+            Vector3d euler = bodyState.rotation.EulerAngles * Mathd.Deg2Rad;
+            double pitchClamped = Mathd.Deg2Rad * maxPitchAngle;
+            double rollClamped = Mathd.Deg2Rad * maxRollAngle;
+            bool needsClamp = false;
+
+            if (euler.x > pitchClamped || euler.x < -pitchClamped)
             {
-                bodyState.angularVelocity = bodyState.angularVelocity.Normalized * maxAngularVelocity;
+                euler.x = Mathd.Clamp(euler.x, -pitchClamped, pitchClamped);
+                needsClamp = true;
+            }
+            if (euler.z > rollClamped || euler.z < -rollClamped)
+            {
+                euler.z = Mathd.Clamp(euler.z, -rollClamped, rollClamped);
+                needsClamp = true;
+            }
+
+            if (needsClamp)
+            {
+                bodyState.rotation = Quaterniond.Euler(euler.x * Mathd.Rad2Deg, euler.y * Mathd.Rad2Deg, euler.z * Mathd.Rad2Deg);
+                bodyState.angularVelocity = Vector3d.Zero;
+            }
+
+            if (bodyState.position.y < -10.0 || bodyState.position.y > 50.0)
+            {
+                bodyState.position = _lastValidPosition;
+                bodyState.linearVelocity = Vector3d.Zero;
             }
         }
 
         public void ApplyExternalForce(Vector3d force, Vector3d position)
         {
-            externalForce += force;
+            Vector3d clampedForce = ClampVectorMagnitude(force, maxTotalForce * 0.5);
+            externalForce += clampedForce;
+
             Vector3d lever = position - bodyState.position;
-            externalTorque += Vector3d.Cross(lever, force);
+            Vector3d torque = Vector3d.Cross(lever, clampedForce);
+            externalTorque += ClampVectorMagnitude(torque, maxTotalTorque * 0.5);
         }
 
         public void ResetDynamics()
@@ -378,10 +524,14 @@ namespace RoadheaderSandbox.Robotics
             bodyState.linearAcceleration = Vector3d.Zero;
             bodyState.angularAcceleration = Vector3d.Zero;
 
+            _lastValidPosition = bodyState.position;
+            _lastValidRotation = bodyState.rotation;
+
             externalForce = Vector3d.Zero;
             externalTorque = Vector3d.Zero;
             currentSpeed = 0;
             currentAdvanceRate = 0;
+            _accumulatedTime = 0;
 
             if (collisionSolver != null)
             {
@@ -425,6 +575,9 @@ namespace RoadheaderSandbox.Robotics
                 Gizmos.DrawCube(Vector3.zero, Vector3.one);
                 Gizmos.matrix = Matrix4x4.identity;
             }
+
+            Gizmos.color = new Color(1, 0, 0, 0.05f);
+            Gizmos.DrawWireSphere(Vector3.zero, (float)maxWorldPositionRadius);
         }
     }
 

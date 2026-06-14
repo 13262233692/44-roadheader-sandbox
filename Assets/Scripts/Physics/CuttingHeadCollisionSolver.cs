@@ -41,6 +41,19 @@ namespace RoadheaderSandbox.Physics
         public bool drawContactForces = true;
         public double forceDrawScale = 0.0001;
 
+        [Header("硬性截断钳制")]
+        [Tooltip("单齿接触力硬上限 (N)")]
+        public double maxPickContactForce = 5.0e4;
+
+        [Tooltip("单齿穿透深度硬上限 (m)")]
+        public double maxPickPenetration = 0.02;
+
+        [Tooltip("截割头总合力硬上限 (N)")]
+        public double maxTotalContactForce = 2.0e6;
+
+        [Tooltip("截割头总扭矩硬上限 (N·m)")]
+        public double maxTotalContactTorque = 1.0e6;
+
         public event Action<int, ContactForce> OnPickContact;
         public event Action<Vector3d, Vector3d> OnTotalForceUpdated;
         public event Action<double, double> OnExcavationUpdated;
@@ -129,6 +142,8 @@ namespace RoadheaderSandbox.Physics
 
                 if (contactPoint.penetrationDepth > 0)
                 {
+                    contactPoint.penetrationDepth = Mathd.Min(contactPoint.penetrationDepth, maxPickPenetration);
+
                     var geometry = contactSolver.CalculateEquivalentGeometry(
                         pickRadius, double.PositiveInfinity, contactPoint.normal);
 
@@ -138,6 +153,25 @@ namespace RoadheaderSandbox.Physics
                     ContactForce contactForce = contactSolver.SolveContact(
                         contactPoint, geometry, material,
                         pick.material, rockSurface.material, deltaTime);
+
+                    double forceMag = contactForce.totalForce.Magnitude;
+                    if (forceMag > maxPickContactForce && forceMag > 1e-15)
+                    {
+                        double ratio = maxPickContactForce / forceMag;
+                        contactForce.totalForce *= ratio;
+                        contactForce.normalForce *= ratio;
+                        contactForce.tangentialForce *= ratio;
+                        contactForce.frictionForce *= ratio;
+                        contactForce.normalStress *= ratio;
+                        contactForce.shearStress *= ratio;
+                    }
+
+                    if (double.IsNaN(contactForce.totalForce.x) || double.IsInfinity(contactForce.totalForce.x) ||
+                        double.IsNaN(contactForce.totalForce.y) || double.IsInfinity(contactForce.totalForce.y) ||
+                        double.IsNaN(contactForce.totalForce.z) || double.IsInfinity(contactForce.totalForce.z))
+                    {
+                        continue;
+                    }
 
                     if (contactForce.totalForce.Magnitude > 0)
                     {
@@ -168,6 +202,32 @@ namespace RoadheaderSandbox.Physics
                         }
                     }
                 }
+            }
+
+            double totalForceMag = totalContactForce.Magnitude;
+            if (totalForceMag > maxTotalContactForce && totalForceMag > 1e-15)
+            {
+                totalContactForce = totalContactForce.Normalized * maxTotalContactForce;
+            }
+
+            if (double.IsNaN(totalContactForce.x) || double.IsInfinity(totalContactForce.x) ||
+                double.IsNaN(totalContactForce.y) || double.IsInfinity(totalContactForce.y) ||
+                double.IsNaN(totalContactForce.z) || double.IsInfinity(totalContactForce.z))
+            {
+                totalContactForce = Vector3d.Zero;
+            }
+
+            double totalTorqueMag = totalContactTorque.Magnitude;
+            if (totalTorqueMag > maxTotalContactTorque && totalTorqueMag > 1e-15)
+            {
+                totalContactTorque = totalContactTorque.Normalized * maxTotalContactTorque;
+            }
+
+            if (double.IsNaN(totalContactTorque.x) || double.IsInfinity(totalContactTorque.x) ||
+                double.IsNaN(totalContactTorque.y) || double.IsInfinity(totalContactTorque.y) ||
+                double.IsNaN(totalContactTorque.z) || double.IsInfinity(totalContactTorque.z))
+            {
+                totalContactTorque = Vector3d.Zero;
             }
 
             OnTotalForceUpdated?.Invoke(totalContactForce, totalContactTorque);
