@@ -2,6 +2,7 @@ using UnityEngine;
 using RoadheaderSandbox.Kinematics;
 using RoadheaderSandbox.Physics;
 using RoadheaderSandbox.Robotics;
+using RoadheaderSandbox.Safety;
 using RoadheaderSandbox.Debug;
 
 namespace RoadheaderSandbox.Debug
@@ -21,6 +22,7 @@ namespace RoadheaderSandbox.Debug
         public ArmSkeletonController armController;
         public RoadheaderDynamics roadheaderDynamics;
         public SimulationController simulationController;
+        public SafetyOrchestrator safetyOrchestrator;
 
         public Transform roadheaderBody;
         public Transform cuttingHead;
@@ -51,6 +53,7 @@ namespace RoadheaderSandbox.Debug
             CreateCollisionSolver();
             CreateMotionController();
             CreateDynamics();
+            CreateSafetySystem();
             CreateSimulationController();
 
             Debug.Log("Scene build complete!");
@@ -339,6 +342,22 @@ namespace RoadheaderSandbox.Debug
 
         private void CreateDynamics()
         {
+        }
+
+        private void CreateSafetySystem()
+        {
+            GameObject safetyObj = new GameObject("SafetySystem");
+            safetyObj.transform.SetParent(sceneRoot, false);
+            safetyOrchestrator = safetyObj.AddComponent<SafetyOrchestrator>();
+            safetyOrchestrator.arm = armController;
+            safetyOrchestrator.cuttingHead = cuttingHeadController;
+            safetyOrchestrator.dynamics = roadheaderDynamics;
+            safetyOrchestrator.collisionSolver = collisionSolver;
+            safetyOrchestrator.rockSurface = rockSurface;
+            safetyOrchestrator.enableSafetySystem = true;
+            safetyOrchestrator.useFixedUpdate = true;
+            safetyOrchestrator.useDynamicsForTCP = true;
+            safetyOrchestrator.tcpOffsetFromBody = new Vector3d(0, 0.8, 4.0);
         }
 
         private void CreateSimulationController()

@@ -4,6 +4,7 @@ using RoadheaderSandbox.Core.Math;
 using RoadheaderSandbox.Kinematics;
 using RoadheaderSandbox.Physics;
 using RoadheaderSandbox.Robotics;
+using RoadheaderSandbox.Safety;
 using UnityEngine;
 
 namespace RoadheaderSandbox.Debug
@@ -18,6 +19,7 @@ namespace RoadheaderSandbox.Debug
         public CuttingHeadCollisionSolver collisionSolver;
         public RoadheaderDynamics dynamics;
         public RockSurface rockSurface;
+        public SafetyOrchestrator safetySystem;
 
         [Header("仿真设置")]
         public bool autoStart = true;
@@ -83,6 +85,9 @@ namespace RoadheaderSandbox.Debug
 
             if (rockSurface == null)
                 rockSurface = FindObjectOfType<RockSurface>();
+
+            if (safetySystem == null)
+                safetySystem = FindObjectOfType<SafetyOrchestrator>();
 
             if (profileGenerator != null)
             {
@@ -190,6 +195,11 @@ namespace RoadheaderSandbox.Debug
             if (dynamics != null)
             {
                 dynamics.ResetDynamics();
+            }
+
+            if (safetySystem != null)
+            {
+                safetySystem.ResetAllSafety();
             }
 
             if (cuttingHeadController != null)
